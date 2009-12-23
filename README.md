@@ -141,6 +141,9 @@ guide). There are a few global config options that should be self-explanatory:
 
   Logfile configuration, as described in configgy.
 
+- `hdfs_dir`
+
+  This specifies the HDFS directory where queue journal files are copied to when the files get rotated.  The files will not be copied to HDFS if this field is not specified.
 
 Performance
 -----------
