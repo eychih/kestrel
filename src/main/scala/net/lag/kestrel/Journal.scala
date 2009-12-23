@@ -22,6 +22,12 @@ import java.io._
 import java.nio.{ByteBuffer, ByteOrder}
 import java.nio.channels.FileChannel
 import net.lag.configgy.{Config, ConfigMap}
+import scala.collection.jcl.MutableIterator.Wrapper
+import java.util.ArrayList
+import java.net.URI
+import org.apache.hadoop.fs.{FileSystem, Path}
+import org.apache.hadoop.conf.Configuration
+import _root_.net.lag.configgy.{Config, ConfigMap, Configgy}
 
 
 // returned from journal replay
@@ -48,7 +54,12 @@ class Journal(queuePath: String, syncJournal: => Boolean) {
   private var writer: FileChannel = null
   private var reader: Option[FileChannel] = None
   private var replayer: Option[FileChannel] = None
-
+  private val hdfsDir = if (Configgy.config==null) "" 
+                        else Configgy.config.getString("hdfs_dir", "")
+  private val hdfsEnabled = !(hdfsDir == "")
+  private val filesToCopy = new ArrayList[String]()
+  private val fs = FileSystem.get(new URI(hdfsDir), new Configuration())
+ 
   var size: Long = 0
 
   // small temporary buffer for formatting operations into the journal:
@@ -68,6 +79,10 @@ class Journal(queuePath: String, syncJournal: => Boolean) {
 
   private def open(file: File): Unit = {
     writer = new FileOutputStream(file, true).getChannel
+    if (hdfsEnabled) {
+      filesToCopy.add(file.getPath)
+      log.info("hdfs enabled")
+    }
   }
 
   def open(): Unit = {
@@ -76,6 +91,7 @@ class Journal(queuePath: String, syncJournal: => Boolean) {
 
   def roll(xid: Int, openItems: List[QItem], queue: Iterable[QItem]): Unit = {
     writer.close
+    if (hdfsEnabled) copyToHDFS
     val tmpFile = new File(queuePath + "~~" + Time.now)
     open(tmpFile)
     size = 0
@@ -91,6 +107,30 @@ class Journal(queuePath: String, syncJournal: => Boolean) {
     writer.close
     tmpFile.renameTo(queueFile)
     open
+  }
+
+  private implicit def javaIterator[String](iter: java.util.Iterator[String]) = 
+    new Wrapper[String](iter) 
+
+  private def copyToHDFS(): Unit = {
+    var src: Path = null
+    var index = 0
+    var dst: Path = null
+    var file: String = null
+    val itr = filesToCopy.iterator
+    while (itr.hasNext) {
+       file = itr.next
+       src = new Path(file)
+       index = file.lastIndexOf('/')
+       dst = new Path(hdfsDir + "/" + queueFile.getName + "/" + file.substring(index+1) + "_" + Time.now)
+       try {
+         log.info("copy %s to %s", src.getName, dst.getName)
+         fs.copyFromLocalFile(src, dst)
+         itr.remove(file) 
+       } catch {
+         case _=>
+       }
+    }
   }
 
   def close(): Unit = {
