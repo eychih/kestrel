@@ -23,7 +23,7 @@ import java.nio.{ByteBuffer, ByteOrder}
 import java.nio.channels.FileChannel
 import net.lag.configgy.{Config, ConfigMap}
 import scala.collection.jcl.MutableIterator.Wrapper
-import java.util.ArrayList
+import java.util.{Arrays, ArrayList}
 import java.net.URI
 import org.apache.hadoop.fs.{FileSystem, Path}
 import org.apache.hadoop.conf.Configuration
@@ -57,7 +57,14 @@ class Journal(queuePath: String, syncJournal: => Boolean) {
   private val hdfsDir = if (Configgy.config==null) "" 
                         else Configgy.config.getString("hdfs_dir", "")
   private val hdfsEnabled = !(hdfsDir == "")
-  private val filesToCopy = new ArrayList[String]()
+  private val filesHere = (new File(queueFile.getParent)).listFiles
+  private val filesToHDFSPattern = ".+[_]\\d{13,}"
+  private val filesToHDFS = 
+            for {
+              file <- filesHere 
+              if file.getName.matches(filesToHDFSPattern)
+            } yield file.getPath 
+  private val filesToCopy = new ArrayList[String](Arrays.asList(filesToHDFS: _*))
   private val fs = FileSystem.get(new URI(hdfsDir), new Configuration())
  
   var size: Long = 0
@@ -79,10 +86,6 @@ class Journal(queuePath: String, syncJournal: => Boolean) {
 
   private def open(file: File): Unit = {
     writer = new FileOutputStream(file, true).getChannel
-    if (hdfsEnabled) {
-      filesToCopy.add(file.getPath)
-      log.info("hdfs enabled")
-    }
   }
 
   def open(): Unit = {
@@ -91,7 +94,6 @@ class Journal(queuePath: String, syncJournal: => Boolean) {
 
   def roll(xid: Int, openItems: List[QItem], queue: Iterable[QItem]): Unit = {
     writer.close
-    if (hdfsEnabled) copyToHDFS
     val tmpFile = new File(queuePath + "~~" + Time.now)
     open(tmpFile)
     size = 0
@@ -105,6 +107,10 @@ class Journal(queuePath: String, syncJournal: => Boolean) {
     }
     if (syncJournal) writer.force(false)
     writer.close
+    if (hdfsEnabled) {
+      filesToCopy.add(queueFile.getPath)
+      copyToHDFS
+    }
     tmpFile.renameTo(queueFile)
     open
   }
@@ -116,21 +122,32 @@ class Journal(queuePath: String, syncJournal: => Boolean) {
     var src: Path = null
     var index = 0
     var dst: Path = null
-    var file: String = null
+    var filePath: String = null
+    var file: File = null
+    var isArchive = false
+    var archiveFile: String = null
     val itr = filesToCopy.iterator
     while (itr.hasNext) {
-       file = itr.next
-       src = new Path(file)
-       index = file.lastIndexOf('/')
-       dst = new Path(hdfsDir + "/" + queueFile.getName + "/" + file.substring(index+1) + "_" + Time.now)
+       filePath = itr.next
+       src = new Path(filePath)
+       file = new File(filePath)
+       isArchive = file.getName.matches(filesToHDFSPattern)
+       if (isArchive)
+         dst = new Path(hdfsDir + "/" + queueFile.getName + "/" + file.getName)
+       else dst = new Path(hdfsDir + "/" + queueFile.getName + "/" + file.getName + "_" + Time.now)
        try {
          log.info("copy %s to %s", src.getName, dst.getName)
          fs.copyFromLocalFile(src, dst)
-         itr.remove(file) 
+         itr.remove(filePath)
+         if (isArchive) file.delete 
        } catch {
-         case _=>
+         case _=>  if (!isArchive) {
+                     archiveFile = filePath + "_" + Time.now
+                     file.renameTo(new File(archiveFile))
+                   }
        }
     }
+    if (archiveFile != null) filesToCopy.add(archiveFile)
   }
 
   def close(): Unit = {
