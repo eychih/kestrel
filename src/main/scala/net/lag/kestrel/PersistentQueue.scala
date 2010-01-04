@@ -114,8 +114,13 @@ class PersistentQueue(persistencePath: String, val name: String,
   // clients waiting on an item in this queue
   private val waiters = new mutable.ArrayBuffer[Waiter]
 
-  private var journal = new Journal(new File(persistencePath, name).getCanonicalPath, syncJournal())
-
+  private var journal = {
+    var index = persistencePath.indexOf("hdfs:/") 
+    if (index == -1)
+      new Journal(new File(persistencePath, name).getCanonicalPath, syncJournal())
+    else new Journal("hdfs://" + persistencePath.substring(index + 6) + "/" + name, syncJournal()) with Hadoop
+  } 
+  
   // track tentative removals
   private var xidCounter: Int = 0
   private val openTransactions = new mutable.HashMap[Int, QItem]
