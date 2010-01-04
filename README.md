@@ -135,15 +135,14 @@ guide). There are a few global config options that should be self-explanatory:
 - `queue_path`
 
   The folder to store queue journal files in. Each queue (and each client of
-  a fanout queue) gets its own file here.
+  a fanout queue) gets its own file here.  For saving to Hadoop File System,
+  the queue_path should be prefixed with "hdfs://hostname:port" (typical 
+  HDFS scheme.)
 
 - `log`
 
   Logfile configuration, as described in configgy.
 
-- `hdfs_dir`
-
-  This specifies the HDFS directory where queue journal files are copied to when the files get rotated.  The files will not be copied to HDFS if this field is not specified.
 
 Performance
 -----------
