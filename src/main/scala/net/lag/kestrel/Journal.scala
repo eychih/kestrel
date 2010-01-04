@@ -21,13 +21,7 @@ import net.lag.logging.Logger
 import java.io._
 import java.nio.{ByteBuffer, ByteOrder}
 import java.nio.channels.FileChannel
-import net.lag.configgy.{Config, ConfigMap}
-import scala.collection.jcl.MutableIterator.Wrapper
-import java.util.{Arrays, ArrayList}
-import java.net.URI
-import org.apache.hadoop.fs.{FileSystem, Path}
-import org.apache.hadoop.conf.Configuration
-import _root_.net.lag.configgy.{Config, ConfigMap, Configgy}
+import net.lag.configgy.{Config, ConfigMap, Configgy}
 
 
 // returned from journal replay
@@ -47,55 +41,43 @@ object JournalItem {
  * Codes for working with the journal file for a PersistentQueue.
  */
 class Journal(queuePath: String, syncJournal: => Boolean) {
-  private val log = Logger.get
+  protected val log = Logger.get
 
-  private val queueFile = new File(queuePath)
+  protected val rawQueuePath = queuePath
+  protected val host = if (Configgy.config==null) ""
+                     else Configgy.config.getString("host", "")
 
-  private var writer: FileChannel = null
-  private var reader: Option[FileChannel] = None
-  private var replayer: Option[FileChannel] = None
-  private val hdfsDir = if (Configgy.config==null) "" 
-                        else Configgy.config.getString("hdfs_dir", "")
-  private val hdfsEnabled = !(hdfsDir == "")
-  private val filesHere = (new File(queueFile.getParent)).listFiles
-  private val filesToHDFSPattern = ".+[_]\\d{13,}"
-  private val filesToHDFS = 
-            for {
-              file <- filesHere 
-              if file.getName.matches(filesToHDFSPattern)
-            } yield file.getPath 
-  private val filesToCopy = new ArrayList[String](Arrays.asList(filesToHDFS: _*))
-  private val fs = FileSystem.get(new URI(hdfsDir), new Configuration())
- 
+  protected val queueFile: Any = new File(queuePath)
+
+  protected var writer: Any = null
+  protected var reader: Option[Any] = None
+  protected var replayer: Option[Any] = None
+
   var size: Long = 0
 
   // small temporary buffer for formatting operations into the journal:
-  private val buffer = new Array[Byte](16)
-  private val byteBuffer = ByteBuffer.wrap(buffer)
+  protected val buffer = new Array[Byte](16)
+  protected val byteBuffer = ByteBuffer.wrap(buffer)
   byteBuffer.order(ByteOrder.LITTLE_ENDIAN)
 
-  private val CMD_ADD = 0
-  private val CMD_REMOVE = 1
-  private val CMD_ADDX = 2
-  private val CMD_REMOVE_TENTATIVE = 3
-  private val CMD_SAVE_XID = 4
-  private val CMD_UNREMOVE = 5
-  private val CMD_CONFIRM_REMOVE = 6
-  private val CMD_ADD_XID = 7
-
-
-  private def open(file: File): Unit = {
-    writer = new FileOutputStream(file, true).getChannel
-  }
+  protected val CMD_ADD = 0
+  protected val CMD_REMOVE = 1
+  protected val CMD_ADDX = 2
+  protected val CMD_REMOVE_TENTATIVE = 3
+  protected val CMD_SAVE_XID = 4
+  protected val CMD_UNREMOVE = 5
+  protected val CMD_CONFIRM_REMOVE = 6
+  protected val CMD_ADD_XID = 7
 
   def open(): Unit = {
     open(queueFile)
   }
 
   def roll(xid: Int, openItems: List[QItem], queue: Iterable[QItem]): Unit = {
-    writer.close
-    val tmpFile = new File(queuePath + "~~" + Time.now)
+    channelClose(writer)
+    val tmpFile = createFileObject(queuePath + "~~" + Time.now)
     open(tmpFile)
+
     size = 0
     for (item <- openItems) {
       addWithXid(item)
@@ -105,61 +87,23 @@ class Journal(queuePath: String, syncJournal: => Boolean) {
     for (item <- queue) {
       add(false, item)
     }
-    if (syncJournal) writer.force(false)
-    writer.close
-    if (hdfsEnabled) {
-      filesToCopy.add(queueFile.getPath)
-      copyToHDFS
-    }
-    tmpFile.renameTo(queueFile)
+
+    if (syncJournal) writerForce(writer, false)
+    channelClose(writer)
+    fileRename(tmpFile, queueFile)
     open
   }
 
-  private implicit def javaIterator[String](iter: java.util.Iterator[String]) = 
-    new Wrapper[String](iter) 
-
-  private def copyToHDFS(): Unit = {
-    var src: Path = null
-    var index = 0
-    var dst: Path = null
-    var filePath: String = null
-    var file: File = null
-    var isArchive = false
-    var archiveFile: String = null
-    val itr = filesToCopy.iterator
-    while (itr.hasNext) {
-       filePath = itr.next
-       src = new Path(filePath)
-       file = new File(filePath)
-       isArchive = file.getName.matches(filesToHDFSPattern)
-       if (isArchive)
-         dst = new Path(hdfsDir + "/" + queueFile.getName + "/" + file.getName)
-       else dst = new Path(hdfsDir + "/" + queueFile.getName + "/" + file.getName + "_" + Time.now)
-       try {
-         log.info("copy %s to %s", src.getName, dst.getName)
-         fs.copyFromLocalFile(src, dst)
-         itr.remove(filePath)
-         if (isArchive) file.delete 
-       } catch {
-         case _=>  if (!isArchive) {
-                     archiveFile = filePath + "_" + Time.now
-                     file.renameTo(new File(archiveFile))
-                   }
-       }
-    }
-    if (archiveFile != null) filesToCopy.add(archiveFile)
-  }
-
   def close(): Unit = {
-    writer.close
-    for (r <- reader) r.close
+    channelClose(writer)
+    for (r <- reader) channelClose(r)
     reader = None
   }
 
   def erase(): Unit = {
     try {
       close()
-      queueFile.delete
+      fileDelete(queueFile)
     } catch {
       case _ =>
     }
@@ -169,26 +113,26 @@ class Journal(queuePath: String, syncJournal: => Boolean) {
 
   def isReplaying(): Boolean = replayer.isDefined
 
-  private def add(allowSync: Boolean, item: QItem): Unit = {
+  protected def add(allowSync: Boolean, item: QItem): Unit = {
     val blob = ByteBuffer.wrap(item.pack())
     size += write(false, CMD_ADDX.toByte, blob.limit)
     do {
-      writer.write(blob)
+      writerWrite(writer, blob)
     } while (blob.position < blob.limit)
-    if (allowSync && syncJournal) writer.force(false)
+    if (allowSync && syncJournal) writerForce(writer, false)
     size += blob.limit
   }
 
   def add(item: QItem): Unit = add(true, item)
 
   // used only to list pending transactions when recreating the journal.
-  private def addWithXid(item: QItem) = {
+  protected def addWithXid(item: QItem) = {
     val blob = ByteBuffer.wrap(item.pack())
 
     // only called from roll(), so the journal does not need to be synced after a write.
     size += write(false, CMD_ADD_XID.toByte, item.xid, blob.limit)
     do {
-      writer.write(blob)
+      writerWrite(writer, blob)
     } while (blob.position < blob.limit)
     size += blob.limit
   }
@@ -197,13 +141,13 @@ class Journal(queuePath: String, syncJournal: => Boolean) {
     size += write(true, CMD_REMOVE.toByte)
   }
 
-  private def removeTentative(allowSync: Boolean): Unit = {
+  protected def removeTentative(allowSync: Boolean): Unit = {
     size += write(allowSync, CMD_REMOVE_TENTATIVE.toByte)
   }
 
   def removeTentative(): Unit = removeTentative(true)
 
-  private def saveXid(xid: Int) = {
+  protected def saveXid(xid: Int) = {
     // only called from roll(), so the journal does not need to be synced after a write.
     size += write(false, CMD_SAVE_XID.toByte, xid)
   }
@@ -217,18 +161,18 @@ class Journal(queuePath: String, syncJournal: => Boolean) {
   }
 
   def startReadBehind(): Unit = {
-    val pos = if (replayer.isDefined) replayer.get.position else writer.position
-    val rj = new FileInputStream(queueFile).getChannel
-    rj.position(pos)
+    val pos = if (replayer.isDefined) channelPosition(replayer.get) else channelPosition(writer)
+    val rj = getInputChannel(queueFile)
+    channelPosition(rj, pos)
     reader = Some(rj)
   }
 
   def fillReadBehind(f: QItem => Unit): Unit = {
-    val pos = if (replayer.isDefined) replayer.get.position else writer.position
+    val pos = if (replayer.isDefined) channelPosition(replayer.get) else channelPosition(writer)
     for (rj <- reader) {
-      if (rj.position == pos) {
+      if (channelPosition(rj) == pos) {
         // we've caught up.
-        rj.close
+        channelClose(rj)
         reader = None
       } else {
         readJournalEntry(rj) match {
@@ -244,7 +188,7 @@ class Journal(queuePath: String, syncJournal: => Boolean) {
     var lastUpdate = 0L
     val TEN_MB = 10L * 1024 * 1024
     try {
-      val in = new FileInputStream(queueFile).getChannel
+      val in = getInputChannel(queueFile) 
       try {
         replayer = Some(in)
         var done = false
@@ -278,22 +222,22 @@ class Journal(queuePath: String, syncJournal: => Boolean) {
     replayer = None
   }
 
-  private def truncateJournal(position: Long) {
-    val trancateWriter = new FileOutputStream(queueFile, true).getChannel
+  protected def truncateJournal(position: Long) {
+    val trancateWriter = getOutputChannel(queueFile)
     try {
-      trancateWriter.truncate(position)
+      truncateFile(trancateWriter, position)
     } finally {
-      trancateWriter.close()
+      channelClose(trancateWriter)
     }
   }
 
-  def readJournalEntry(in: FileChannel): (JournalItem, Int) = {
+  def readJournalEntry(in: Any): (JournalItem, Int) = {
     byteBuffer.rewind
     byteBuffer.limit(1)
-    val lastPosition = in.position
+    val lastPosition = channelPosition(in)
     var x: Int = 0
     do {
-      x = in.read(byteBuffer)
+      x = journalRead(in, byteBuffer)
     } while (byteBuffer.position < byteBuffer.limit && x >= 0)
 
     if (x < 0) {
@@ -327,7 +271,7 @@ class Journal(queuePath: String, syncJournal: => Boolean) {
             item.xid = xid
             (JournalItem.Add(item), 9 + data.length)
           case n =>
-            throw new BrokenItemException(lastPosition, new IOException("invalid opcode in journal: " + n.toInt + " at position " + in.position))
+            throw new BrokenItemException(lastPosition, new IOException("invalid opcode in journal: " + n.toInt + " at position " + channelPosition(in)))
         }
       } catch {
         case ex: IOException =>
@@ -337,7 +281,7 @@ class Journal(queuePath: String, syncJournal: => Boolean) {
   }
 
   def walk() = new Iterator[(JournalItem, Int)] {
-    val in = new FileInputStream(queuePath).getChannel
+    val in = getInputChannel(queueFile)
     var done = false
     var nextItem: Option[(JournalItem, Int)] = None
 
@@ -348,7 +292,7 @@ class Journal(queuePath: String, syncJournal: => Boolean) {
         nextItem = readJournalEntry(in) match {
           case (JournalItem.EndOfFile, _) =>
             done = true
-            in.close()
+            channelClose(in)
             None
           case x =>
             Some(x)
@@ -360,13 +304,13 @@ class Journal(queuePath: String, syncJournal: => Boolean) {
     def next() = nextItem.get
   }
 
-  private def readBlock(in: FileChannel): Array[Byte] = {
+  protected def readBlock(in: Any): Array[Byte] = {
     val size = readInt(in)
     val data = new Array[Byte](size)
     val dataBuffer = ByteBuffer.wrap(data)
     var x: Int = 0
     do {
-      x = in.read(dataBuffer)
+      x = journalRead(in, dataBuffer)
     } while (dataBuffer.position < dataBuffer.limit && x >= 0)
     if (x < 0) {
       // we never expect EOF when reading a block.
@@ -375,12 +319,12 @@ class Journal(queuePath: String, syncJournal: => Boolean) {
     data
   }
 
-  private def readInt(in: FileChannel): Int = {
+  protected def readInt(in: Any): Int = {
     byteBuffer.rewind
     byteBuffer.limit(4)
     var x: Int = 0
     do {
-      x = in.read(byteBuffer)
+      x = journalRead(in, byteBuffer)
     } while (byteBuffer.position < byteBuffer.limit && x >= 0)
     if (x < 0) {
       // we never expect EOF when reading an int.
@@ -390,7 +334,7 @@ class Journal(queuePath: String, syncJournal: => Boolean) {
     byteBuffer.getInt()
   }
 
-  private def write(allowSync: Boolean, items: Any*): Int = {
+  protected def write(allowSync: Boolean, items: Any*): Int = {
     byteBuffer.clear
     for (item <- items) item match {
       case b: Byte => byteBuffer.put(b)
@@ -398,9 +342,66 @@ class Journal(queuePath: String, syncJournal: => Boolean) {
     }
     byteBuffer.flip
     while (byteBuffer.position < byteBuffer.limit) {
-      writer.write(byteBuffer)
+      writerWrite(writer, byteBuffer)
     }
-    if (allowSync && syncJournal) writer.force(false)
+    if (allowSync && syncJournal) writerForce(writer, false)
     byteBuffer.limit
   }
+
+  /**
+   * Refactor from original version.  The codes can be overriden
+   * for journal to host on other storage system, such as HDFS, in 
+   * cloud computing environments
+   */
+  protected def open(f: Any): Unit =  (f: @unchecked) match {
+    case file: File => writer = new FileOutputStream(file, true).getChannel
+  }
+
+  protected def channelClose(c: Any): Unit = (c: @unchecked) match {
+    case channel: FileChannel => channel.close
+  }
+
+  protected def createFileObject(s: String): Any = {
+    new File(s)
+  }
+
+  protected def truncateFile(c: Any, pos: Long): Unit = (c: @unchecked) match {
+    case channel: FileChannel => channel.truncate(pos)
+  }
+
+  protected def writerWrite(w: Any, blob: ByteBuffer): Unit = (w: @unchecked) match {
+    case writer: FileChannel => writer.write(blob)
+  }
+
+  protected def writerForce(w: Any, bool: Boolean): Unit = (w: @unchecked) match {
+    case writer: FileChannel => writer.force(bool)
+  }
+
+  protected def fileRename(s: Any, d: Any): Unit = ((s, d): @unchecked) match {
+    case (src: File, dest: File) => src.renameTo(dest)
+  }
+
+  protected def fileDelete(f: Any): Unit = (f: @unchecked) match {
+    case file: File => file.delete
+  }
+ 
+  protected def channelPosition(c: Any): Long = (c: @unchecked) match {
+    case channel: FileChannel => channel.position
+  }
+
+  protected def channelPosition(c: Any, pos: Long): Unit = (c: @unchecked) match {
+    case channel: FileChannel => channel.position(pos)
+  }
+
+  protected def getOutputChannel(f: Any): Any = (f: @unchecked)  match {
+    case queueFile: File => new FileOutputStream(queueFile, true).getChannel
+  }
+
+  protected def getInputChannel(f: Any): Any = (f: @unchecked) match {
+    case queueFile: File => new FileInputStream(queueFile).getChannel
+  }
+
+  protected def journalRead(channel: Any, buffer: ByteBuffer): Int = (channel: @unchecked) match {
+    case in: FileChannel => in.read(buffer)
+  } 
 }
